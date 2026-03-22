@@ -36,4 +36,4 @@ export interface HistoryItem {
   config?: MealConfig;
 }
 
-export type AppState = 'SELECTION' | 'LOADING' | 'RESULT' | 'SEARCH';
+export type AppState = 'SELECTION' | 'LOADING' | 'RESULT' | 'SEARCH' | 'MAP';

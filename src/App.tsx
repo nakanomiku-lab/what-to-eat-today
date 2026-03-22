@@ -8,8 +8,9 @@ import SearchBar from './components/SearchBar';
 import RecipeList from './components/RecipeList';
 import PreferenceSelector from './components/PreferenceSelector';
 import MealConfigurator from './components/MealConfigurator';
+import MapView from './components/MapView';
 import { generateRecipe, generateSingleSideDish, searchRecipes } from './services/geminiService';
-import { UtensilsCrossed, History, X, Clock, Trash2 } from 'lucide-react';
+import { UtensilsCrossed, History, X, Clock, Trash2, Map as MapIcon } from 'lucide-react';
 import { triggerHaptic } from './utils/sound';
 
 const App: React.FC = () => {
@@ -259,6 +260,18 @@ const App: React.FC = () => {
     fetchDish(selectedMeal, preferences, mealConfig, currentNames);
   };
 
+  const handleOpenMap = () => {
+    triggerHaptic();
+    setShowHistory(false);
+    setShowConfig(false);
+    setAppState('MAP');
+  };
+
+  const handleCloseMap = () => {
+    triggerHaptic();
+    setAppState('SELECTION');
+  };
+
   const restoreHistory = (item: HistoryItem) => {
       setSelectedMeal(item.mealType);
       setCurrentDishes(item.dishes);
@@ -298,7 +311,8 @@ const App: React.FC = () => {
           />
       )}
 
-      <button 
+      {appState !== 'MAP' && (
+        <button 
         onClick={() => {
             setShowHistory(true);
             setConfirmClearHistory(false);
@@ -307,7 +321,8 @@ const App: React.FC = () => {
         title="历史足迹"
       >
           <Clock size={24} />
-      </button>
+        </button>
+      )}
 
       {showHistory && (
           <div className="fixed inset-0 z-50 flex justify-end">
@@ -392,24 +407,26 @@ const App: React.FC = () => {
           </div>
       )}
 
-      <header className={`mb-8 text-center animate-slideDown transition-all ${appState !== 'SELECTION' ? 'scale-90' : ''}`}>
-        <div 
-            className="inline-flex items-center justify-center p-3 bg-orange-500 rounded-2xl shadow-lg mb-4 text-white rotate-3 cursor-pointer hover:rotate-6 transition-transform"
-            onClick={handleRestart}
-        >
-          <UtensilsCrossed size={32} />
-        </div>
-        <h1 className="text-4xl md:text-5xl font-extrabold text-gray-900 tracking-tight mb-2">
-          今天吃什么
-        </h1>
-        {appState === 'SELECTION' && (
-          <p className="text-gray-600 text-lg">
-             先设置偏好，再选择时段，为您生成专属美味
-          </p>
-        )}
-      </header>
+      {appState !== 'MAP' && (
+        <header className={`mb-8 text-center animate-slideDown transition-all ${appState !== 'SELECTION' ? 'scale-90' : ''}`}>
+          <div 
+              className="inline-flex items-center justify-center p-3 bg-orange-500 rounded-2xl shadow-lg mb-4 text-white rotate-3 cursor-pointer hover:rotate-6 transition-transform"
+              onClick={handleRestart}
+          >
+            <UtensilsCrossed size={32} />
+          </div>
+          <h1 className="text-4xl md:text-5xl font-extrabold text-gray-900 tracking-tight mb-2">
+            今天吃什么
+          </h1>
+          {appState === 'SELECTION' && (
+            <p className="text-gray-600 text-lg">
+               先设置偏好，再选择时段，为您生成专属美味
+            </p>
+          )}
+        </header>
+      )}
 
-      <main className="w-full flex flex-col items-center justify-start flex-1">
+      <main className={`w-full flex flex-col items-center justify-start ${appState === 'MAP' ? '' : 'flex-1'}`}>
         
         {appState === 'SELECTION' && (
           <>
@@ -418,6 +435,26 @@ const App: React.FC = () => {
                 onSuggestionSelect={handleSelectFromResult}
                 initialValue=""
             />
+            <div className="mb-6 w-full max-w-5xl">
+              <button
+                onClick={handleOpenMap}
+                className="group w-full rounded-[28px] border border-orange-200 bg-white/90 px-6 py-4 text-left shadow-xl shadow-orange-100/70 transition-all hover:-translate-y-1 hover:border-orange-300 hover:shadow-2xl"
+              >
+                <div className="flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-4">
+                    <div className="rounded-2xl bg-orange-500 p-3 text-white shadow-lg shadow-orange-200 transition-transform group-hover:rotate-6">
+                      <MapIcon size={24} />
+                    </div>
+                    <div>
+                      <p className="text-lg font-bold text-gray-900">附近地图</p>
+                    </div>
+                  </div>
+                  <div className="text-sm font-semibold text-orange-600 transition-transform group-hover:translate-x-1">
+                    进入
+                  </div>
+                </div>
+              </button>
+            </div>
             <div className="mb-10 w-full flex justify-center">
                 <MealSelector onSelect={handleMealSelect} disabled={false} />
             </div>
@@ -458,11 +495,17 @@ const App: React.FC = () => {
             replacingIndex={replacingIndex}
           />
         )}
+
+        {appState === 'MAP' && (
+          <MapView onBack={handleCloseMap} />
+        )}
       </main>
 
-      <footer className="mt-12 text-gray-400 text-sm pb-4">
-        精选美味推荐
-      </footer>
+      {appState !== 'MAP' && (
+        <footer className="mt-12 text-gray-400 text-sm pb-4">
+          精选美味推荐
+        </footer>
+      )}
     </div>
   );
 };
