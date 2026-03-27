@@ -25,6 +25,10 @@ npm install
 npm run dev
 ```
 
+这条命令现在会同时启动：
+- Vite 前端开发服务器
+- 本地高德代理服务
+
 3. 启动桌面开发环境
 
 ```bash
@@ -60,6 +64,23 @@ npm run preview
 - 之后再次定位失败时，地图会自动回退到你保存的默认地点
 - 如果在浏览器里单独调试网页版本，则仍然走浏览器自己的定位权限流程
 
+## 国内地址精确搜索
+
+桌面版和网页端地图搜索都已经切到高德链路，适合搜索国内地址、小区、商场和地标。
+
+1. 在项目根目录创建 `.env.local`
+2. 填入下面这一项
+
+```bash
+AMAP_WEB_SERVICE_KEY=你的高德Web服务Key
+```
+
+- Electron 启动器和网页端本地代理都会自动读取 `.env` 和 `.env.local`
+- 这个 Key 只需要项目开发者配置一次，不需要应用用户手动输入
+- 当前地图搜索会同时用到高德 `地理编码`、`关键字搜索` 和 `输入提示`
+- 网页端不再把高德 Key 暴露到前端，而是通过本地代理 `/api/amap/*` 转发
+- 当前地图底图仍然是 OpenStreetMap，所以程序内部会把高德返回的 GCJ-02 坐标转换后再落到地图上
+
 ## 项目结构
 
 ```text
@@ -80,12 +101,14 @@ src/index.css    全局样式与 Tailwind 入口
 ## 常用脚本
 
 ```text
-npm run dev           仅启动 Vite 网页开发
+npm run dev           启动 Vite + 本地高德代理
 npm run dev:desktop   启动 Electron + Vite 桌面开发
+npm run dev:proxy     单独启动网页端高德代理
 npm run build         构建网页产物到 dist/
 npm run package       打包当前平台桌面应用
 npm run package:win   打包 Windows 安装程序
 npm run package:dir   生成未压缩桌面产物
+npm run start:proxy   启动本地高德代理
 npm run start:desktop 使用现有 dist/ 启动 Electron
 ```
 

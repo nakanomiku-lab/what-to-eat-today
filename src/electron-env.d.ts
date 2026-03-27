@@ -1,6 +1,14 @@
 export {};
 
 declare global {
+  interface ImportMetaEnv {
+    readonly VITE_AMAP_PROXY_BASE_URL?: string;
+  }
+
+  interface ImportMeta {
+    readonly env: ImportMetaEnv;
+  }
+
   interface DesktopLocationSuccessResult {
     ok: true;
     source: string;
@@ -40,6 +48,32 @@ declare global {
     results: DesktopGeocodeResultItem[];
   }
 
+  interface DesktopInputTipItem {
+    id: string;
+    name: string;
+    displayName: string;
+    district: string;
+    address: string;
+    adcode?: string;
+    type: string;
+    lat?: number | null;
+    lng?: number | null;
+  }
+
+  interface DesktopInputTipsSuccessResult {
+    ok: true;
+    source: string;
+    query: string;
+    tips: DesktopInputTipItem[];
+  }
+
+  interface DesktopInputTipsErrorResult {
+    ok: false;
+    code: string;
+    message: string;
+    tips: DesktopInputTipItem[];
+  }
+
   interface Window {
     desktopApp?: {
       isElectron: boolean;
@@ -50,6 +84,13 @@ declare global {
         geocodeAddress: (
           query: string
         ) => Promise<DesktopGeocodeSuccessResult | DesktopGeocodeErrorResult>;
+        getInputTips: (payload: {
+          query: string;
+          location?: {
+            lat: number;
+            lng: number;
+          };
+        }) => Promise<DesktopInputTipsSuccessResult | DesktopInputTipsErrorResult>;
         openSystemLocationSettings: () => Promise<boolean>;
       };
       versions: {

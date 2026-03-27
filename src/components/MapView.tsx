@@ -5,10 +5,8 @@ import {
   ArrowLeft,
   ExternalLink,
   LocateFixed,
-  MapPinned,
   Navigation,
   RefreshCw,
-  Search,
 } from 'lucide-react';
 import { triggerHaptic } from '../utils/sound';
 import { FALLBACK_LOCATIONS, FallbackLocation } from '../data/fallbackLocations';
@@ -202,7 +200,7 @@ const buildFallbackLocationFromAddressResult = (
   result: DesktopGeocodeResultItem
 ): FallbackLocation => {
   const parts = result.displayName
-    .split(',')
+    .split(/[，,]/)
     .map((part: string) => part.trim())
     .filter(Boolean);
 
@@ -216,52 +214,95 @@ const buildFallbackLocationFromAddressResult = (
   };
 };
 
-const geocodeAddressInBrowser = async (
-  query: string
-): Promise<DesktopGeocodeSuccessResult | DesktopGeocodeErrorResult> => {
-  const params = new URLSearchParams({
-    q: query.trim(),
-    format: 'jsonv2',
-    addressdetails: '1',
-    limit: '5',
-    dedupe: '1',
-  });
+const buildFallbackLocationFromInputTip = (tip: DesktopInputTipItem): FallbackLocation | null => {
+  if (!Number.isFinite(tip.lat) || !Number.isFinite(tip.lng)) {
+    return null;
+  }
 
-  const response = await fetch(`https://nominatim.openstreetmap.org/search?${params.toString()}`, {
+  return {
+    id: `tip-${tip.id}`,
+    name: tip.name || '输入提示地点',
+    region: tip.district || tip.type || '输入提示',
+    lat: Number(tip.lat),
+    lng: Number(tip.lng),
+    note: tip.displayName,
+  };
+};
+
+const getBrowserProxyBaseUrl = () => {
+  const configuredBaseUrl = import.meta.env.VITE_AMAP_PROXY_BASE_URL?.trim();
+  if (configuredBaseUrl) {
+    return configuredBaseUrl.replace(/\/$/, '');
+  }
+
+  if (
+    typeof window !== 'undefined' &&
+    (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost')
+  ) {
+    return 'http://127.0.0.1:5174/api';
+  }
+
+  return '/api';
+};
+
+const BROWSER_PROXY_BASE_URL = getBrowserProxyBaseUrl();
+
+const requestBrowserProxyJson = async (pathname: string, params: URLSearchParams) => {
+  const response = await fetch(`${BROWSER_PROXY_BASE_URL}${pathname}?${params.toString()}`, {
     headers: {
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+      Accept: 'application/json',
     },
   });
 
   if (!response.ok) {
+    throw new Error(`网页端地图代理暂时不可用（HTTP ${response.status}）。`);
+  }
+
+  return response.json();
+};
+
+const geocodeAddressInBrowser = async (
+  query: string
+): Promise<DesktopGeocodeSuccessResult | DesktopGeocodeErrorResult> => {
+  try {
+    const params = new URLSearchParams({
+      query: query.trim(),
+    });
+
+    return await requestBrowserProxyJson('/amap/geocode', params);
+  } catch (error) {
     return {
       ok: false,
-      code: 'HTTP_ERROR',
-      message: `地址搜索服务暂时不可用（HTTP ${response.status}）。`,
+      code: 'PROXY_REQUEST_FAILED',
+      message: error instanceof Error ? error.message : '网页端地址搜索代理请求失败。',
       results: [],
     };
   }
+};
 
-  const payload = await response.json();
-  const results = Array.isArray(payload)
-    ? payload
-        .map((item) => ({
-          id: `${item.place_id ?? item.osm_id ?? item.display_name}`,
-          displayName: item.display_name,
-          lat: Number(item.lat),
-          lng: Number(item.lon),
-          type: item.type || item.addresstype || item.category || '地点',
-          licence: item.licence || '',
-        }))
-        .filter((item) => Number.isFinite(item.lat) && Number.isFinite(item.lng))
-    : [];
+const getInputTipsInBrowser = async (payload: {
+  query: string;
+  location?: Coordinates;
+}): Promise<DesktopInputTipsSuccessResult | DesktopInputTipsErrorResult> => {
+  try {
+    const params = new URLSearchParams({
+      query: payload.query.trim(),
+    });
 
-  return {
-    ok: true,
-    source: 'nominatim',
-    query: query.trim(),
-    results,
-  };
+    if (payload.location) {
+      params.set('lat', String(payload.location.lat));
+      params.set('lng', String(payload.location.lng));
+    }
+
+    return await requestBrowserProxyJson('/amap/inputtips', params);
+  } catch (error) {
+    return {
+      ok: false,
+      code: 'PROXY_REQUEST_FAILED',
+      message: error instanceof Error ? error.message : '网页端输入提示代理请求失败。',
+      tips: [],
+    };
+  }
 };
 
 const matchAddressToFallbackLocations = (query: string): DesktopGeocodeResultItem[] => {
@@ -289,10 +330,12 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
   const mapElementRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
   const markerLayerRef = useRef<L.LayerGroup | null>(null);
+  const baseTileLayerRef = useRef<L.TileLayer | null>(null);
 
   const desktopRuntime = window.desktopApp;
   const isElectron = Boolean(desktopRuntime?.isElectron);
   const usesWindowsNativeLocation = desktopRuntime?.location?.provider === 'windows-native';
+  const supportsInputTips = isElectron ? Boolean(desktopRuntime?.location?.getInputTips) : true;
   const [savedFallbackLocation, setSavedFallbackLocation] = useState<FallbackLocation | null>(() =>
     readSavedFallbackLocation()
   );
@@ -309,12 +352,15 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
   const [browserPermissionState, setBrowserPermissionState] =
     useState<BrowserPermissionStateValue>('unknown');
   const [hasPreciseLocation, setHasPreciseLocation] = useState(false);
+  const [isBaseMapReady, setIsBaseMapReady] = useState(false);
+  const [baseMapError, setBaseMapError] = useState('');
   const [locationSource, setLocationSource] = useState<LocationSource>('default');
   const [locationSourceLabel, setLocationSourceLabel] = useState('默认地图中心');
-  const [manualQuery, setManualQuery] = useState('');
   const [addressQuery, setAddressQuery] = useState('');
+  const [inputTips, setInputTips] = useState<DesktopInputTipItem[]>([]);
+  const [isInputTipsLoading, setIsInputTipsLoading] = useState(false);
   const [addressResults, setAddressResults] = useState<DesktopGeocodeResultItem[]>([]);
-  const [addressSearchMessage, setAddressSearchMessage] = useState('输入地址后点击搜索，再从结果里选择一个位置。');
+  const [addressSearchMessage, setAddressSearchMessage] = useState('输入国内地址、小区、商场或地标后搜索。');
   const [isAddressSearching, setIsAddressSearching] = useState(false);
   const [activeFallbackLocationId, setActiveFallbackLocationId] = useState<string | null>(
     savedFallbackLocation?.id ?? null
@@ -326,14 +372,6 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
 
   const spots = buildDemoSpots(center);
   const selectedSpot = spots.find((spot) => spot.id === selectedSpotId) ?? spots[0];
-  const filteredFallbackLocations = FALLBACK_LOCATIONS.filter((location) => {
-    const keyword = manualQuery.trim().toLowerCase();
-    if (!keyword) {
-      return true;
-    }
-
-    return `${location.name} ${location.region} ${location.note}`.toLowerCase().includes(keyword);
-  });
 
   const applyMapCenter = (
     nextCenter: Coordinates,
@@ -371,7 +409,7 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
     setSavedFallbackLocation(null);
     if (locationSource === 'saved' && currentSavedLocation) {
       setLocationSource('manual');
-      setLocationSourceLabel('手动城市');
+      setLocationSourceLabel('手动地点');
       setLocationStatus(`已经取消 ${currentSavedLocation.name} 的默认地点状态。`);
       setLocationAdvice(`当前位置仍保持在 ${currentSavedLocation.name}，只是以后定位失败时不会再自动回退到这里。`);
       return;
@@ -396,14 +434,14 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
           status ||
           (source === 'saved'
             ? `这次没有拿到实时位置，已回退到你保存的默认地点：${location.name}。`
-            : `已切换到你手动选择的城市：${location.name}。`),
+            : `已切换到你手动选择的地点：${location.name}。`),
         advice:
           advice ||
           (source === 'saved'
-            ? '如果你换了常驻区域，可以在下面重新选择并保存一个新的默认地点。'
+            ? '如果你常用地点变了，可以重新搜索并保存一个新的默认地点。'
             : location.note),
         source,
-        sourceLabel: source === 'saved' ? '默认地点' : '手动城市',
+        sourceLabel: source === 'saved' ? '默认地点' : '手动地点',
         fallbackLocationId: location.id,
         fallbackLocation: location,
         zoom: 13,
@@ -417,7 +455,7 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
         savedFallbackLocation,
         'saved',
         `${status} 已自动回退到你保存的默认地点。`,
-        `${advice} 你也可以在下面换成别的城市。`
+        `${advice} 你也可以重新搜索一个地点。`
       );
       return;
     }
@@ -425,17 +463,12 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
     applyMapCenter(DEFAULT_CENTER, {
       precise: false,
       status,
-      advice: `${advice} 你也可以在下面手动选择一个城市作为兜底地点。`,
+      advice: `${advice} 你也可以搜索一个常用地点，并把它保存成默认地点。`,
       source: 'default',
       sourceLabel: '默认地图中心',
       fallbackLocation: null,
       zoom: 13,
     });
-  };
-
-  const handleChooseFallbackLocation = (location: FallbackLocation) => {
-    triggerHaptic();
-    applyPresetLocation(location, 'manual');
   };
 
   const handleUseSavedFallbackLocation = () => {
@@ -448,7 +481,7 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
       savedFallbackLocation,
       'saved',
       `已切换到你保存的默认地点：${savedFallbackLocation.name}。`,
-      '如果你最近常驻地点变了，也可以在下面换一个城市再保存。'
+      '如果你最近常用地点变了，也可以重新搜索一个地点再保存。'
     );
   };
 
@@ -490,6 +523,14 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
     map.flyTo([center.lat, center.lng], hasPreciseLocation ? 15 : 13, { duration: 0.8 });
   };
 
+  const refreshBaseMap = () => {
+    triggerHaptic();
+    setBaseMapError('');
+    setIsBaseMapReady(false);
+    mapRef.current?.invalidateSize();
+    baseTileLayerRef.current?.redraw();
+  };
+
   const openSystemLocationSettings = async () => {
     triggerHaptic();
     try {
@@ -499,17 +540,25 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
     }
   };
 
-  const handleAddressSearch = async () => {
-    const keyword = addressQuery.trim();
+  const runAddressSearch = async (
+    rawKeyword: string,
+    options?: {
+      loadingMessage?: string;
+      emptyMessage?: string;
+    }
+  ) => {
+    const keyword = rawKeyword.trim();
     if (!keyword) {
-      setAddressSearchMessage('先输入一个完整一些的地址，比如“上海市静安区南京西路”。');
+      setAddressSearchMessage(
+        options?.emptyMessage || '先输入一个国内地址或地标，比如“上海市静安区南京西路”或“北京三里屯太古里”。'
+      );
       setAddressResults([]);
       return;
     }
 
-    triggerHaptic();
     setIsAddressSearching(true);
-    setAddressSearchMessage('正在搜索地址，请稍等...');
+    setInputTips([]);
+    setAddressSearchMessage(options?.loadingMessage || '正在搜索地址，请稍等...');
 
     try {
       const result = isElectron
@@ -540,12 +589,12 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
         }
 
         setAddressResults([]);
-        setAddressSearchMessage('没有找到匹配的地址，试试补充区县、商圈、路名或门牌号。');
+        setAddressSearchMessage('没有找到匹配的国内地址，试试补充城市、区县、商圈、路名或门牌号。');
         return;
       }
 
       setAddressResults(result.results);
-      setAddressSearchMessage('已找到候选地址，点一个结果就能把地图切过去。');
+      setAddressSearchMessage('已找到候选地点，点一个结果就能把地图切过去。');
     } catch {
       setAddressResults([]);
       setAddressSearchMessage('地址搜索失败了，请检查网络后再试。');
@@ -554,10 +603,50 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
     }
   };
 
+  const handleAddressSearch = async () => {
+    triggerHaptic();
+    await runAddressSearch(addressQuery);
+  };
+
+  const handleChooseInputTip = async (tip: DesktopInputTipItem) => {
+    triggerHaptic();
+    setAddressQuery(tip.name || tip.displayName);
+    setInputTips([]);
+
+    const fallbackLocation = buildFallbackLocationFromInputTip(tip);
+    if (fallbackLocation) {
+      setAddressResults([]);
+      applyMapCenter(
+        {
+          lat: fallbackLocation.lat,
+          lng: fallbackLocation.lng,
+        },
+        {
+          precise: false,
+          status: `已切换到输入提示匹配的位置：${fallbackLocation.name}。`,
+          advice: fallbackLocation.note,
+          source: 'manual',
+          sourceLabel: '输入提示',
+          fallbackLocationId: fallbackLocation.id,
+          fallbackLocation,
+          zoom: 15,
+        }
+      );
+      setAddressSearchMessage('已根据输入提示切到候选位置。');
+      return;
+    }
+
+    await runAddressSearch(tip.name || tip.displayName, {
+      loadingMessage: '正在根据输入提示继续搜索更精确的位置...',
+      emptyMessage: '这个输入提示还不够完整，可以补充城市、区县或路名后再搜。',
+    });
+  };
+
   const handleChooseAddressResult = (result: DesktopGeocodeResultItem) => {
     const fallbackLocation = buildFallbackLocationFromAddressResult(result);
 
     triggerHaptic();
+    setInputTips([]);
     applyMapCenter(
       {
         lat: fallbackLocation.lat,
@@ -751,6 +840,60 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
   }, [usesWindowsNativeLocation]);
 
   useEffect(() => {
+    if (!supportsInputTips) {
+      setInputTips([]);
+      setIsInputTipsLoading(false);
+      return;
+    }
+
+    const keyword = addressQuery.trim();
+    if (keyword.length < 2) {
+      setInputTips([]);
+      setIsInputTipsLoading(false);
+      return;
+    }
+
+    let disposed = false;
+    const timer = window.setTimeout(() => {
+      setIsInputTipsLoading(true);
+      const request =
+        isElectron && desktopRuntime?.location?.getInputTips
+          ? desktopRuntime.location.getInputTips({
+              query: keyword,
+              location: center,
+            })
+          : getInputTipsInBrowser({
+              query: keyword,
+              location: center,
+            });
+
+      request
+        .then((result) => {
+          if (disposed) {
+            return;
+          }
+
+          setInputTips(result?.ok ? result.tips : []);
+        })
+        .catch(() => {
+          if (!disposed) {
+            setInputTips([]);
+          }
+        })
+        .finally(() => {
+          if (!disposed) {
+            setIsInputTipsLoading(false);
+          }
+        });
+    }, 220);
+
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+    };
+  }, [addressQuery, center, desktopRuntime?.location, isElectron, supportsInputTips]);
+
+  useEffect(() => {
     if (!mapElementRef.current || mapRef.current) {
       return;
     }
@@ -762,21 +905,62 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
 
     L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    const tileLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
       attribution: '&copy; OpenStreetMap contributors',
     }).addTo(map);
 
-    mapRef.current = map;
-    window.requestAnimationFrame(() => {
-      map.invalidateSize();
+    let tileErrorCount = 0;
+    tileLayer.on('load', () => {
+      tileErrorCount = 0;
+      setIsBaseMapReady(true);
+      setBaseMapError('');
     });
+    tileLayer.on('tileerror', () => {
+      tileErrorCount += 1;
+      if (tileErrorCount >= 4) {
+        setBaseMapError('网页端底图暂时没有加载出来，可以点右上角按钮再试一次。');
+      }
+    });
+
+    mapRef.current = map;
+    baseTileLayerRef.current = tileLayer;
+
+    const invalidate = () => {
+      map.invalidateSize();
+    };
+
+    const timeoutIds = [
+      window.setTimeout(invalidate, 0),
+      window.setTimeout(invalidate, 180),
+      window.setTimeout(invalidate, 420),
+    ];
+
+    const resizeHandler = () => {
+      map.invalidateSize();
+    };
+    window.addEventListener('resize', resizeHandler);
+
+    const resizeObserver =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => {
+            map.invalidateSize();
+          })
+        : null;
+
+    if (resizeObserver && mapElementRef.current) {
+      resizeObserver.observe(mapElementRef.current);
+    }
 
     void locateUser();
 
     return () => {
+      timeoutIds.forEach((timeoutId) => window.clearTimeout(timeoutId));
+      window.removeEventListener('resize', resizeHandler);
+      resizeObserver?.disconnect();
       markerLayerRef.current?.remove();
       markerLayerRef.current = null;
+      baseTileLayerRef.current = null;
       map.remove();
       mapRef.current = null;
     };
@@ -814,7 +998,7 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
           : locationSource === 'saved'
             ? '这里是你保存的默认地点。'
             : locationSource === 'manual'
-              ? '这里是你手动选择的城市中心。'
+              ? '这里是你手动选择的位置。'
               : '这里是默认展示的地图中心。'
       );
 
@@ -841,294 +1025,251 @@ const MapView: React.FC<MapViewProps> = ({ onBack }) => {
   }, [center, hasPreciseLocation, locationSource, selectedSpotId]);
 
   return (
-    <div className="w-full max-w-6xl animate-scaleIn pb-4">
-      <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <button
-          onClick={() => {
-            triggerHaptic();
-            onBack();
-          }}
-          className="inline-flex items-center justify-center rounded-full bg-white px-5 py-3 text-sm font-semibold text-gray-700 shadow-lg shadow-orange-100 transition-all hover:-translate-y-0.5 hover:text-orange-600"
-        >
-          <ArrowLeft size={18} className="mr-2" />
-          返回主界面
-        </button>
+    <div className="w-full max-w-6xl pb-4">
+      <section className="relative overflow-hidden rounded-[32px] border border-orange-100 bg-white shadow-2xl shadow-orange-100/70">
+        <div ref={mapElementRef} className="h-[68vh] min-h-[620px] w-full md:h-[74vh]" />
 
-        <div className="flex flex-wrap gap-3">
-          <button
-            onClick={() => {
-              void locateUser(true);
-            }}
-            className="inline-flex items-center justify-center rounded-full bg-orange-500 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-orange-200 transition-all hover:-translate-y-0.5 hover:bg-orange-600"
-          >
-            <LocateFixed size={18} className="mr-2" />
-            重新定位
-          </button>
-          <button
-            onClick={recenterMap}
-            className="inline-flex items-center justify-center rounded-full bg-white px-5 py-3 text-sm font-semibold text-gray-700 shadow-lg shadow-orange-100 transition-all hover:-translate-y-0.5 hover:text-orange-600"
-          >
-            <RefreshCw size={18} className="mr-2" />
-            回到当前位置
-          </button>
-        </div>
-      </div>
+        {!isBaseMapReady && !baseMapError && (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-orange-50/80 text-sm font-semibold text-orange-700 backdrop-blur-[1px]">
+            正在加载地图...
+          </div>
+        )}
 
-      <div className="grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
-        <aside className="rounded-[28px] border border-orange-100 bg-white/90 p-5 shadow-xl shadow-orange-100/70 backdrop-blur-md">
-          <h2 className="text-2xl font-bold text-gray-900">附近地图</h2>
-
-          <div className="mt-4 rounded-3xl bg-orange-50 p-4">
-            <div className="flex items-start gap-3">
-              <div className="mt-1 rounded-full bg-orange-500 p-2 text-white">
-                <MapPinned size={16} />
-              </div>
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <p className="text-sm font-semibold text-gray-900">当前位置状态</p>
-                  <span className="rounded-full bg-stone-100 px-2 py-1 text-xs font-semibold text-stone-700">
-                    {usesWindowsNativeLocation ? 'Windows 原生定位' : '浏览器定位'}
-                  </span>
-                  <span className="rounded-full bg-orange-100 px-2 py-1 text-xs font-semibold text-orange-700">
-                    来源：{locationSourceLabel}
-                  </span>
-                  {!usesWindowsNativeLocation && (
-                    <span
-                      className={`rounded-full px-2 py-1 text-xs font-semibold ${getBrowserPermissionStateClasses(browserPermissionState)}`}
-                    >
-                      权限：{getBrowserPermissionStateLabel(browserPermissionState)}
-                    </span>
-                  )}
-                </div>
-                <p className="mt-2 text-sm leading-6 text-gray-700">{locationStatus}</p>
-                <p className="mt-2 text-xs text-gray-500">
-                  中心点：{formatCoordinate(center.lat)}, {formatCoordinate(center.lng)}
-                </p>
-              </div>
+        {baseMapError && (
+          <div className="absolute inset-0 flex items-center justify-center bg-orange-50/90 px-6 text-center">
+            <div className="max-w-sm rounded-3xl border border-orange-200 bg-white/95 p-5 shadow-lg shadow-orange-100">
+              <p className="text-sm font-semibold text-gray-900">{baseMapError}</p>
+              <button
+                onClick={refreshBaseMap}
+                className="mt-4 inline-flex items-center justify-center rounded-full bg-orange-500 px-4 py-2 text-sm font-semibold text-white transition-all hover:-translate-y-0.5 hover:bg-orange-600"
+              >
+                重新加载地图
+              </button>
             </div>
           </div>
+        )}
 
-          {usesWindowsNativeLocation && (
-            <button
-              onClick={() => {
-                void openSystemLocationSettings();
-              }}
-              className="mt-4 inline-flex items-center rounded-full bg-white px-4 py-3 text-sm font-semibold text-gray-700 shadow-lg shadow-orange-100 transition-all hover:-translate-y-0.5 hover:text-orange-600"
-            >
-              <ExternalLink size={16} className="mr-2" />
-              打开 Windows 定位设置
-            </button>
-          )}
-
-          <div className="mt-4 rounded-3xl border border-orange-100 bg-white p-4 shadow-lg shadow-orange-50">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-sm font-semibold text-gray-900">手动位置</p>
-              {savedFallbackLocation && (
-                <button
-                  onClick={clearSavedFallbackLocation}
-                  className="rounded-full bg-stone-100 px-3 py-2 text-xs font-semibold text-stone-600 transition-colors hover:bg-stone-200"
-                >
-                  清除默认地点
-                </button>
-              )}
-            </div>
-
-            <div className="mt-4 flex flex-wrap gap-2">
-              {savedFallbackLocation ? (
-                <button
-                  onClick={handleUseSavedFallbackLocation}
-                  className="inline-flex items-center rounded-full bg-orange-500 px-4 py-2 text-xs font-semibold text-white shadow-md shadow-orange-100 transition-all hover:-translate-y-0.5 hover:bg-orange-600"
-                >
-                  使用默认地点：{savedFallbackLocation.name}
-                </button>
-              ) : (
-                <span className="rounded-full bg-stone-100 px-3 py-2 text-xs font-semibold text-stone-500">
-                  还没有保存默认地点
-                </span>
-              )}
-
-              {activeFallbackLocationId && locationSource !== 'saved' && !hasPreciseLocation && (
-                <button
-                  onClick={handleSaveCurrentFallbackLocation}
-                  className="inline-flex items-center rounded-full bg-white px-4 py-2 text-xs font-semibold text-orange-600 shadow-md shadow-orange-100 transition-all hover:-translate-y-0.5 hover:text-orange-700"
-                >
-                  保存当前地点为默认地点
-                </button>
-              )}
-            </div>
-
-            <div className="mt-4 rounded-2xl bg-orange-50 p-4">
-              <div className="flex items-center gap-2 text-sm font-semibold text-gray-900">
-                <Search size={16} className="text-orange-500" />
-                手动输入地址
-              </div>
-
-              <div className="mt-3 flex gap-2">
-                <input
-                  value={addressQuery}
-                  onChange={(event) => setAddressQuery(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault();
-                      void handleAddressSearch();
-                    }
-                  }}
-                  placeholder="比如：上海市静安区南京西路"
-                  className="min-w-0 flex-1 rounded-2xl border border-orange-100 bg-white px-4 py-3 text-sm text-gray-700 outline-none transition-colors focus:border-orange-300"
-                />
-                <button
-                  onClick={() => {
+        <div className="absolute left-4 right-4 top-4 z-[500]">
+          <div className="pointer-events-auto w-full max-w-sm">
+            <div className="flex gap-2">
+              <input
+                value={addressQuery}
+                onChange={(event) => {
+                  setAddressQuery(event.target.value);
+                  setAddressResults([]);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
                     void handleAddressSearch();
-                  }}
-                  disabled={isAddressSearching}
-                  className="rounded-2xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white shadow-md shadow-orange-100 transition-all hover:-translate-y-0.5 hover:bg-orange-600 disabled:translate-y-0 disabled:cursor-not-allowed disabled:bg-orange-300"
-                >
-                  {isAddressSearching ? '搜索中' : '搜索'}
-                </button>
-              </div>
+                  }
+                }}
+                placeholder="比如：上海市静安区南京西路 / 北京三里屯太古里"
+                className="min-w-0 flex-1 rounded-2xl border border-orange-100 bg-white px-3 py-2 text-sm text-gray-700 outline-none transition-colors focus:border-orange-300"
+              />
+              <button
+                onClick={() => {
+                  void handleAddressSearch();
+                }}
+                disabled={isAddressSearching}
+                className="rounded-2xl bg-orange-500 px-4 py-2 text-sm font-semibold text-white shadow-md shadow-orange-100 transition-all hover:-translate-y-0.5 hover:bg-orange-600 disabled:translate-y-0 disabled:cursor-not-allowed disabled:bg-orange-300"
+              >
+                {isAddressSearching ? '搜索中' : '搜索'}
+              </button>
+            </div>
 
-              <p className="mt-3 text-xs text-gray-500">{addressSearchMessage}</p>
-
-              {addressResults.length > 0 && (
-                <div className="mt-3 space-y-2">
-                  {addressResults.map((result) => {
-                    const isActive = activeFallbackLocationId === `address-${result.id}`;
-
-                    return (
+            {supportsInputTips && addressQuery.trim().length >= 2 && (
+              <div className="mt-3">
+                {inputTips.length > 0 && (
+                  <div className="mt-2 max-h-[24vh] space-y-2 overflow-y-auto pr-1 custom-scrollbar">
+                    {inputTips.map((tip) => (
                       <button
-                        key={result.id}
-                        onClick={() => handleChooseAddressResult(result)}
-                        className={`w-full rounded-2xl border px-3 py-3 text-left transition-all ${
-                          isActive
-                            ? 'border-orange-300 bg-white shadow-md shadow-orange-100'
-                            : 'border-transparent bg-white/70 hover:border-orange-200 hover:bg-white'
-                        }`}
+                        key={tip.id}
+                        onClick={() => {
+                          void handleChooseInputTip(tip);
+                        }}
+                        className="w-full rounded-2xl border border-transparent bg-white/70 px-3 py-3 text-left transition-all hover:border-orange-200 hover:bg-white"
                       >
                         <div className="flex items-center justify-between gap-3">
-                          <span className="text-sm font-semibold text-gray-900">
-                            {buildFallbackLocationFromAddressResult(result).name}
-                          </span>
+                          <span className="text-sm font-semibold text-gray-900">{tip.name}</span>
                           <span className="rounded-full bg-stone-100 px-2 py-1 text-[10px] font-semibold text-stone-600">
-                            {result.type}
+                            {tip.lat != null && tip.lng != null ? '可直达' : '联想'}
                           </span>
                         </div>
-                        <p className="mt-1 text-xs leading-5 text-gray-500">{result.displayName}</p>
+                        <p className="mt-1 text-xs leading-5 text-gray-500">{tip.displayName}</p>
                       </button>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
-            <div className="mt-4 rounded-2xl bg-stone-50 p-3">
-              <label className="flex items-center gap-2 text-xs font-semibold text-stone-500">
-                <Search size={14} />
-                城市
-              </label>
-              <input
-                value={manualQuery}
-                onChange={(event) => setManualQuery(event.target.value)}
-                placeholder="输入城市名"
-                className="mt-2 w-full rounded-2xl border border-orange-100 bg-white px-4 py-3 text-sm text-gray-700 outline-none transition-colors focus:border-orange-300"
-              />
-            </div>
+            {addressResults.length > 0 && (
+              <div className="mt-3 max-h-[26vh] space-y-2 overflow-y-auto pr-1 custom-scrollbar">
+                {addressResults.map((result) => {
+                  const isActive = activeFallbackLocationId === `address-${result.id}`;
 
-            <div className="mt-4 grid grid-cols-2 gap-2">
-              {filteredFallbackLocations.slice(0, 8).map((location) => {
-                const isActive = activeFallbackLocationId === location.id;
-                const isSaved = savedFallbackLocation?.id === location.id;
-
-                return (
-                  <button
-                    key={location.id}
-                    onClick={() => handleChooseFallbackLocation(location)}
-                    className={`rounded-2xl border px-3 py-3 text-left transition-all ${
-                      isActive
-                        ? 'border-orange-300 bg-orange-50 shadow-md shadow-orange-100'
-                        : 'border-transparent bg-stone-50 hover:border-orange-200 hover:bg-white'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-sm font-semibold text-gray-900">{location.name}</span>
-                      {isSaved && (
-                        <span className="rounded-full bg-orange-100 px-2 py-1 text-[10px] font-semibold text-orange-700">
-                          默认
+                  return (
+                    <button
+                      key={result.id}
+                      onClick={() => handleChooseAddressResult(result)}
+                      className={`w-full rounded-2xl border px-3 py-3 text-left transition-all ${
+                        isActive
+                          ? 'border-orange-300 bg-white shadow-md shadow-orange-100'
+                          : 'border-transparent bg-white/70 hover:border-orange-200 hover:bg-white'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-sm font-semibold text-gray-900">
+                          {buildFallbackLocationFromAddressResult(result).name}
                         </span>
-                      )}
-                    </div>
-                    <p className="mt-1 text-xs text-gray-500">{location.region}</p>
-                  </button>
-                );
-              })}
-            </div>
-
-            {filteredFallbackLocations.length === 0 && (
-              <p className="mt-3 text-xs text-gray-500">
-                没找到匹配城市。
-              </p>
+                        <span className="rounded-full bg-stone-100 px-2 py-1 text-[10px] font-semibold text-stone-600">
+                          {result.type}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs leading-5 text-gray-500">{result.displayName}</p>
+                    </button>
+                  );
+                })}
+              </div>
             )}
           </div>
+        </div>
+      </section>
 
-          <div className="mt-6">
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-lg font-bold text-gray-900">附近点位</h3>
-              <span className="text-xs text-gray-400">{spots.length} 个</span>
+      <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.1fr)_360px]">
+        <section className="rounded-[28px] border border-orange-100 bg-white/90 p-5 shadow-xl shadow-orange-100/70 backdrop-blur-md">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-xl font-bold text-gray-900">位置与默认地点</h2>
+              <p className="mt-2 text-sm leading-6 text-gray-600">{locationStatus}</p>
+              <p className="mt-1 text-xs leading-5 text-gray-500">{locationAdvice}</p>
+              <p className="mt-2 text-xs text-gray-500">
+                {locationSourceLabel} · {usesWindowsNativeLocation ? 'Windows 原生定位' : '浏览器定位'} · 中心点：
+                {' '}
+                {formatCoordinate(center.lat)}, {formatCoordinate(center.lng)}
+              </p>
             </div>
 
-            <div className="space-y-3">
-              {spots.map((spot) => {
-                const isActive = spot.id === selectedSpotId;
-
-                return (
-                  <button
-                    key={spot.id}
-                    onClick={() => focusSpot(spot)}
-                    className={`w-full rounded-3xl border p-4 text-left transition-all ${
-                      isActive
-                        ? 'border-orange-300 bg-orange-50 shadow-md shadow-orange-100'
-                        : 'border-transparent bg-stone-50 hover:border-orange-200 hover:bg-white'
-                    }`}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="text-base font-semibold text-gray-900">{spot.name}</p>
-                      </div>
-                      <span
-                        className="rounded-full px-2 py-1 text-xs font-semibold"
-                        style={{
-                          color: spot.strokeColor,
-                          backgroundColor: `${spot.fillColor}26`,
-                        }}
-                      >
-                        {spot.tag}
-                      </span>
-                    </div>
-
-                    <div className="mt-3 flex items-center text-xs text-gray-500">
-                      <Navigation size={14} className="mr-2" />
-                      约 {spot.distanceLabel}
-                    </div>
-                  </button>
-                );
-              })}
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => {
+                  triggerHaptic();
+                  onBack();
+                }}
+                className="inline-flex items-center rounded-full bg-white px-4 py-3 text-sm font-semibold text-gray-700 shadow-md shadow-orange-100 transition-all hover:-translate-y-0.5 hover:text-orange-600"
+              >
+                <ArrowLeft size={18} className="mr-2" />
+                返回
+              </button>
+              <button
+                onClick={() => {
+                  void locateUser(true);
+                }}
+                className="inline-flex items-center rounded-full bg-orange-500 px-4 py-3 text-sm font-semibold text-white shadow-md shadow-orange-100 transition-all hover:-translate-y-0.5 hover:bg-orange-600"
+              >
+                <LocateFixed size={18} className="mr-2" />
+                重新定位
+              </button>
+              <button
+                onClick={recenterMap}
+                className="inline-flex items-center rounded-full bg-white px-4 py-3 text-sm font-semibold text-gray-700 shadow-md shadow-orange-100 transition-all hover:-translate-y-0.5 hover:text-orange-600"
+              >
+                <RefreshCw size={18} className="mr-2" />
+                回到当前位置
+              </button>
+              {usesWindowsNativeLocation && (
+                <button
+                  onClick={() => {
+                    void openSystemLocationSettings();
+                  }}
+                  className="inline-flex items-center rounded-full bg-stone-100 px-4 py-3 text-sm font-semibold text-gray-700 transition-all hover:-translate-y-0.5 hover:bg-white hover:text-orange-600"
+                >
+                  <ExternalLink size={16} className="mr-2" />
+                  Windows 定位设置
+                </button>
+              )}
             </div>
           </div>
-        </aside>
 
-        <section className="relative overflow-hidden rounded-[32px] border border-orange-100 bg-white shadow-2xl shadow-orange-100/70">
-          <div ref={mapElementRef} className="h-[560px] w-full md:h-[680px]" />
+          <div className="mt-4 flex flex-wrap gap-2">
+            {savedFallbackLocation ? (
+              <button
+                onClick={handleUseSavedFallbackLocation}
+                className="inline-flex items-center rounded-full bg-orange-500 px-4 py-2 text-sm font-semibold text-white shadow-md shadow-orange-100 transition-all hover:-translate-y-0.5 hover:bg-orange-600"
+              >
+                使用默认地点：{savedFallbackLocation.name}
+              </button>
+            ) : (
+              <span className="rounded-full bg-stone-100 px-3 py-2 text-sm font-semibold text-stone-500">
+                还没有保存默认地点
+              </span>
+            )}
 
-          <div className="pointer-events-none absolute bottom-4 left-4 right-4 rounded-3xl border border-white/70 bg-white/92 p-4 shadow-lg backdrop-blur-md md:left-auto md:max-w-sm">
-            <div className="flex items-center text-sm font-semibold text-orange-700">
-              <MapPinned size={16} className="mr-2" />
-              当前点位
-            </div>
-            <p className="mt-2 text-base font-semibold text-gray-900">{selectedSpot.name}</p>
-            <p className="mt-2 text-xs text-gray-500">
-              {selectedSpot.tag} · 约 {selectedSpot.distanceLabel}
-            </p>
+            {activeFallbackLocationId && locationSource !== 'saved' && !hasPreciseLocation && (
+              <button
+                onClick={handleSaveCurrentFallbackLocation}
+                className="inline-flex items-center rounded-full bg-white px-4 py-2 text-sm font-semibold text-orange-600 shadow-md shadow-orange-100 transition-all hover:-translate-y-0.5 hover:text-orange-700"
+              >
+                保存当前地点为默认地点
+              </button>
+            )}
+
+            {savedFallbackLocation && (
+              <button
+                onClick={clearSavedFallbackLocation}
+                className="inline-flex items-center rounded-full bg-stone-100 px-4 py-2 text-sm font-semibold text-stone-600 transition-colors hover:bg-stone-200"
+              >
+                清除默认地点
+              </button>
+            )}
           </div>
         </section>
+
+        <aside className="rounded-[28px] border border-orange-100 bg-white/90 p-5 shadow-xl shadow-orange-100/70 backdrop-blur-md">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-lg font-bold text-gray-900">附近点位</h3>
+            <span className="text-xs text-gray-400">{spots.length} 个</span>
+          </div>
+
+          <div className="max-h-[420px] space-y-3 overflow-y-auto pr-1 custom-scrollbar">
+            {spots.map((spot) => {
+              const isActive = spot.id === selectedSpotId;
+
+              return (
+                <button
+                  key={spot.id}
+                  onClick={() => focusSpot(spot)}
+                  className={`w-full rounded-3xl border p-4 text-left transition-all ${
+                    isActive
+                      ? 'border-orange-300 bg-orange-50 shadow-md shadow-orange-100'
+                      : 'border-transparent bg-stone-50 hover:border-orange-200 hover:bg-white'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-base font-semibold text-gray-900">{spot.name}</p>
+                    </div>
+                    <span
+                      className="rounded-full px-2 py-1 text-xs font-semibold"
+                      style={{
+                        color: spot.strokeColor,
+                        backgroundColor: `${spot.fillColor}26`,
+                      }}
+                    >
+                      {spot.tag}
+                    </span>
+                  </div>
+
+                  <div className="mt-3 flex items-center text-xs text-gray-500">
+                    <Navigation size={14} className="mr-2" />
+                    约 {spot.distanceLabel}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </aside>
       </div>
     </div>
   );

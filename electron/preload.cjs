@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('desktopApp', {
     provider: process.platform === 'win32' ? 'windows-native' : 'unsupported',
     getCurrentPosition: () => ipcRenderer.invoke('desktop-location:get-current'),
     geocodeAddress: (query) => ipcRenderer.invoke('desktop-location:geocode-address', query),
+    getInputTips: (payload) => ipcRenderer.invoke('desktop-location:get-input-tips', payload),
     openSystemLocationSettings: () => ipcRenderer.invoke('desktop-location:open-settings'),
   },
   versions: {

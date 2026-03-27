@@ -1,124 +1,57 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
-const { execFile } = require('node:child_process');
+const fs = require('node:fs');
+const http = require('node:http');
 const path = require('node:path');
-const { gcj02ToWgs84 } = require('./coordinates.cjs');
+const { gcj02ToWgs84 } = require('../electron/coordinates.cjs');
 
 const rootDir = path.join(__dirname, '..');
+const host = process.env.AMAP_PROXY_HOST || '127.0.0.1';
+const port = Number(process.env.AMAP_PROXY_PORT || '5174');
 const geocodeCache = new Map();
 const inputTipCache = new Map();
 let lastGeocodeAt = 0;
 let lastInputTipAt = 0;
 const AMAP_WEB_SERVICE_BASE_URL = 'https://restapi.amap.com';
 
-const WINDOWS_LOCATION_SCRIPT = `
-$ErrorActionPreference = 'Stop'
-$watcher = $null
-
-try {
-  Add-Type -AssemblyName System.Device
-  $watcher = New-Object System.Device.Location.GeoCoordinateWatcher
-  $started = $watcher.TryStart($false, [TimeSpan]::FromSeconds(10))
-
-  if (-not $started) {
-    @{ ok = $false; code = 'START_FAILED'; message = 'Windows 定位服务未能启动。' } |
-      ConvertTo-Json -Compress |
-      Write-Output
-    exit 0
+function parseEnvValue(rawValue) {
+  const trimmed = rawValue.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
   }
 
-  $location = $watcher.Position.Location
-  if ($location -and -not $location.IsUnknown) {
-    @{
-      ok = $true
-      source = 'windows-native'
-      coords = @{
-        lat = [double]$location.Latitude
-        lng = [double]$location.Longitude
-        accuracy = [double]$location.HorizontalAccuracy
-      }
-    } |
-      ConvertTo-Json -Compress |
-      Write-Output
-  } else {
-    @{ ok = $false; code = 'LOCATION_UNKNOWN'; message = 'Windows 未返回可用的位置数据。' } |
-      ConvertTo-Json -Compress |
-      Write-Output
-  }
-} catch {
-  @{ ok = $false; code = 'ERROR'; message = $_.Exception.Message } |
-    ConvertTo-Json -Compress |
-    Write-Output
-} finally {
-  if ($watcher) {
-    $watcher.Stop()
-  }
+  return trimmed;
 }
-`;
 
-function createWindow() {
-  const mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 860,
-    minWidth: 1080,
-    minHeight: 720,
-    autoHideMenuBar: true,
-    backgroundColor: '#fff7ed',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.cjs'),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
-
-  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
-  if (devServerUrl) {
-    mainWindow.loadURL(devServerUrl);
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
+function loadEnvFile(filePath) {
+  if (!fs.existsSync(filePath)) {
     return;
   }
 
-  mainWindow.loadFile(path.join(rootDir, 'dist', 'index.html'));
+  const content = fs.readFileSync(filePath, 'utf8');
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf('=');
+    if (separatorIndex <= 0) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    if (!key || process.env[key]) {
+      continue;
+    }
+
+    process.env[key] = parseEnvValue(trimmed.slice(separatorIndex + 1));
+  }
 }
 
-function getWindowsCurrentLocation() {
-  return new Promise((resolve) => {
-    execFile(
-      'powershell.exe',
-      ['-NoProfile', '-Command', WINDOWS_LOCATION_SCRIPT],
-      {
-        windowsHide: true,
-        timeout: 15000,
-      },
-      (error, stdout, stderr) => {
-        const rawOutput = stdout
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter(Boolean)
-          .pop();
-
-        if (!rawOutput) {
-          resolve({
-            ok: false,
-            code: 'NO_OUTPUT',
-            message:
-              stderr.trim() || error?.message || 'Windows 原生定位接口没有返回可用结果。',
-          });
-          return;
-        }
-
-        try {
-          resolve(JSON.parse(rawOutput));
-        } catch {
-          resolve({
-            ok: false,
-            code: 'PARSE_ERROR',
-            message: `无法解析 Windows 定位结果：${rawOutput}`,
-          });
-        }
-      }
-    );
-  });
-}
+loadEnvFile(path.join(rootDir, '.env'));
+loadEnvFile(path.join(rootDir, '.env.local'));
 
 function wait(ms) {
   return new Promise((resolve) => {
@@ -126,14 +59,14 @@ function wait(ms) {
   });
 }
 
-function getAmapWebServiceKey() {
-  return (process.env.AMAP_WEB_SERVICE_KEY || process.env.VITE_AMAP_WEB_SERVICE_KEY || '').trim();
-}
-
 function rateLimit(lastAt, minDelay) {
   const now = Date.now();
   const elapsed = now - lastAt;
   return elapsed < minDelay ? minDelay - elapsed : 0;
+}
+
+function getAmapWebServiceKey() {
+  return (process.env.AMAP_WEB_SERVICE_KEY || process.env.VITE_AMAP_WEB_SERVICE_KEY || '').trim();
 }
 
 function parseLngLat(location) {
@@ -207,6 +140,31 @@ function toAmapPoiResult(item, index) {
   };
 }
 
+function toAmapInputTip(item, index) {
+  const coords = parseLngLat(item.location);
+  const mappedCoords = coords ? gcj02ToWgs84(coords.lat, coords.lng) : null;
+  const name = String(item.name || '').trim();
+  const district = String(item.district || '').trim();
+  const address = String(item.address || '').trim();
+  const displayName = buildAddressSegments([name, address, district]).join('，') || name || district;
+
+  if (!displayName) {
+    return null;
+  }
+
+  return {
+    id: `amap-tip-${index}-${item.id || item.adcode || name || displayName}`,
+    name: name || displayName,
+    displayName,
+    district,
+    address,
+    adcode: String(item.adcode || '').trim() || undefined,
+    type: item.type || '输入提示',
+    lat: mappedCoords?.lat ?? null,
+    lng: mappedCoords?.lng ?? null,
+  };
+}
+
 function dedupeGeocodeResults(results) {
   const seen = new Set();
 
@@ -241,7 +199,7 @@ async function requestAmapJson(pathname, params) {
   const response = await fetch(`${AMAP_WEB_SERVICE_BASE_URL}${pathname}?${params.toString()}`, {
     headers: {
       Accept: 'application/json',
-      'User-Agent': 'what-to-eat-today-electron/1.0 (amap address search)',
+      'User-Agent': 'what-to-eat-today-proxy/1.0 (amap web proxy)',
     },
   });
 
@@ -252,33 +210,8 @@ async function requestAmapJson(pathname, params) {
   return response.json();
 }
 
-function toAmapInputTip(item, index) {
-  const coords = parseLngLat(item.location);
-  const mappedCoords = coords ? gcj02ToWgs84(coords.lat, coords.lng) : null;
-  const name = String(item.name || '').trim();
-  const district = String(item.district || '').trim();
-  const address = String(item.address || '').trim();
-  const displayName = buildAddressSegments([name, address, district]).join('，') || name || district;
-
-  if (!displayName) {
-    return null;
-  }
-
-  return {
-    id: `amap-tip-${index}-${item.id || item.adcode || name || displayName}`,
-    name: name || displayName,
-    displayName,
-    district,
-    address,
-    adcode: String(item.adcode || '').trim() || undefined,
-    type: item.type || '输入提示',
-    lat: mappedCoords?.lat ?? null,
-    lng: mappedCoords?.lng ?? null,
-  };
-}
-
 async function geocodeAddress(query) {
-  const normalizedQuery = query.trim();
+  const normalizedQuery = String(query || '').trim();
   if (!normalizedQuery) {
     return {
       ok: false,
@@ -298,7 +231,7 @@ async function geocodeAddress(query) {
     return {
       ok: false,
       code: 'AMAP_KEY_MISSING',
-      message: '还没有配置高德 Web 服务 Key，暂时不能做国内精确地址搜索。',
+      message: '还没有配置高德 Web 服务 Key，网页端暂时不能做国内精确地址搜索。',
       results: [],
     };
   }
@@ -369,7 +302,7 @@ async function geocodeAddress(query) {
 
   const result = {
     ok: true,
-    source: 'amap',
+    source: 'amap-proxy',
     query: normalizedQuery,
     results,
   };
@@ -378,13 +311,13 @@ async function geocodeAddress(query) {
   return result;
 }
 
-async function getInputTips(payload) {
-  const query = String(payload?.query || '').trim();
-  if (query.length < 2) {
+async function getInputTips(query, location) {
+  const normalizedQuery = String(query || '').trim();
+  if (normalizedQuery.length < 2) {
     return {
       ok: true,
-      source: 'amap-inputtips',
-      query,
+      source: 'amap-inputtips-proxy',
+      query: normalizedQuery,
       tips: [],
     };
   }
@@ -394,19 +327,19 @@ async function getInputTips(payload) {
     return {
       ok: false,
       code: 'AMAP_KEY_MISSING',
-      message: '还没有配置高德 Web 服务 Key，暂时不能加载地址联想。',
+      message: '还没有配置高德 Web 服务 Key，网页端暂时不能加载地址联想。',
       tips: [],
     };
   }
 
-  const location =
-    payload?.location &&
-    Number.isFinite(payload.location.lat) &&
-    Number.isFinite(payload.location.lng)
-      ? `${payload.location.lng},${payload.location.lat}`
+  const normalizedLocation =
+    location &&
+    Number.isFinite(location.lat) &&
+    Number.isFinite(location.lng)
+      ? `${location.lng},${location.lat}`
       : '';
 
-  const cacheKey = `${query}|${location}`;
+  const cacheKey = `${normalizedQuery}|${normalizedLocation}`;
   const cached = inputTipCache.get(cacheKey);
   if (cached) {
     return cached;
@@ -420,36 +353,36 @@ async function getInputTips(payload) {
 
   const params = new URLSearchParams({
     key: amapKey,
-    keywords: query,
+    keywords: normalizedQuery,
     datatype: 'all',
     citylimit: 'false',
     output: 'JSON',
   });
 
-  if (location) {
-    params.set('location', location);
+  if (normalizedLocation) {
+    params.set('location', normalizedLocation);
   }
 
-  const payloadJson = await requestAmapJson('/v3/assistant/inputtips', params);
-  if (String(payloadJson?.status) !== '1') {
+  const payload = await requestAmapJson('/v3/assistant/inputtips', params);
+  if (String(payload?.status) !== '1') {
     return {
       ok: false,
       code: 'AMAP_INPUT_TIPS_FAILED',
-      message: String(payloadJson?.info || '').trim() || '高德输入提示服务暂时不可用。',
+      message: String(payload?.info || '').trim() || '高德输入提示服务暂时不可用。',
       tips: [],
     };
   }
 
   const tips = dedupeInputTips(
-    (Array.isArray(payloadJson?.tips) ? payloadJson.tips : [])
+    (Array.isArray(payload?.tips) ? payload.tips : [])
       .map((item, index) => toAmapInputTip(item, index))
       .filter(Boolean)
   ).slice(0, 8);
 
   const result = {
     ok: true,
-    source: 'amap-inputtips',
-    query,
+    source: 'amap-inputtips-proxy',
+    query: normalizedQuery,
     tips,
   };
 
@@ -457,73 +390,92 @@ async function getInputTips(payload) {
   return result;
 }
 
-ipcMain.handle('desktop-location:get-current', async () => {
-  if (process.platform !== 'win32') {
-    return {
-      ok: false,
-      code: 'UNSUPPORTED',
-      message: '当前原生定位实现只接入了 Windows。',
-    };
-  }
-
-  return getWindowsCurrentLocation();
-});
-
-ipcMain.handle('desktop-location:geocode-address', async (_event, query) => {
-  try {
-    return await geocodeAddress(String(query || ''));
-  } catch (error) {
-    return {
-      ok: false,
-      code: 'REQUEST_FAILED',
-      message: error instanceof Error ? error.message : '地址搜索请求失败。',
-      results: [],
-    };
-  }
-});
-
-ipcMain.handle('desktop-location:get-input-tips', async (_event, payload) => {
-  try {
-    return await getInputTips(payload || {});
-  } catch (error) {
-    return {
-      ok: false,
-      code: 'REQUEST_FAILED',
-      message: error instanceof Error ? error.message : '地址联想请求失败。',
-      tips: [],
-    };
-  }
-});
-
-ipcMain.handle('desktop-location:open-settings', async () => {
-  if (process.platform !== 'win32') {
-    return false;
-  }
-
-  await shell.openExternal('ms-settings:privacy-location');
-  return true;
-});
-
-app.whenReady().then(() => {
-  if (process.platform === 'win32') {
-    app.setAppUserModelId('com.matchprogram.whattoeat');
-  }
-
-  createWindow();
-
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
+function sendJson(response, statusCode, payload) {
+  response.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Cache-Control': 'no-store',
   });
-});
+  response.end(JSON.stringify(payload));
+}
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
+const server = http.createServer(async (request, response) => {
+  if (!request.url) {
+    sendJson(response, 400, { ok: false, code: 'BAD_REQUEST', message: '缺少请求地址。' });
+    return;
   }
+
+  if (request.method === 'OPTIONS') {
+    response.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    });
+    response.end();
+    return;
+  }
+
+  if (request.method !== 'GET') {
+    sendJson(response, 405, { ok: false, code: 'METHOD_NOT_ALLOWED', message: '仅支持 GET 请求。' });
+    return;
+  }
+
+  const url = new URL(request.url, `http://${host}:${port}`);
+
+  if (url.pathname === '/health') {
+    sendJson(response, 200, {
+      ok: true,
+      service: 'amap-proxy',
+      keyConfigured: Boolean(getAmapWebServiceKey()),
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/amap/geocode') {
+    try {
+      const result = await geocodeAddress(url.searchParams.get('query'));
+      sendJson(response, 200, result);
+    } catch (error) {
+      sendJson(response, 500, {
+        ok: false,
+        code: 'REQUEST_FAILED',
+        message: error instanceof Error ? error.message : '地址搜索代理请求失败。',
+        results: [],
+      });
+    }
+    return;
+  }
+
+  if (url.pathname === '/api/amap/inputtips') {
+    const lat = Number(url.searchParams.get('lat'));
+    const lng = Number(url.searchParams.get('lng'));
+    const location =
+      Number.isFinite(lat) && Number.isFinite(lng)
+        ? {
+            lat,
+            lng,
+          }
+        : null;
+
+    try {
+      const result = await getInputTips(url.searchParams.get('query'), location);
+      sendJson(response, 200, result);
+    } catch (error) {
+      sendJson(response, 500, {
+        ok: false,
+        code: 'REQUEST_FAILED',
+        message: error instanceof Error ? error.message : '输入提示代理请求失败。',
+        tips: [],
+      });
+    }
+    return;
+  }
+
+  sendJson(response, 404, { ok: false, code: 'NOT_FOUND', message: '未找到对应的代理接口。' });
 });
 
-app.on('web-contents-created', (_event, contents) => {
-  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+server.listen(port, host, () => {
+  console.log(`AMap proxy listening on http://${host}:${port}`);
 });
